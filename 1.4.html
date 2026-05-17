@@ -1,0 +1,446 @@
+
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>等距柱状投影全景图 (Latitude Longitude Layout)</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #000;
+            color: #fff;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            user-select: none;
+        }
+        /* 隐藏鼠标指针的类 */
+        .hide-cursor, .hide-cursor * {
+            cursor: none !important;
+        }
+        #ui-layer {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            background: rgba(15, 15, 15, 0.85);
+            backdrop-filter: blur(5px);
+            z-index: 10;
+            transition: opacity 0.5s ease;
+        }
+        .panel {
+            background: #222;
+            padding: 30px;
+            border-radius: 12px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.8);
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+            width: 340px;
+            box-sizing: border-box;
+        }
+        .panel h2 {
+            margin: 0;
+            font-size: 20px;
+            text-align: center;
+            letter-spacing: 1px;
+        }
+        .form-group {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+        .form-group label {
+            font-size: 14px;
+            color: #bbb;
+        }
+        input[type="file"], input[type="number"] {
+            width: 100%;
+            padding: 10px;
+            box-sizing: border-box;
+            border-radius: 6px;
+            border: 1px solid #444;
+            background: #111;
+            color: white;
+            font-size: 14px;
+        }
+        input[type="file"]::file-selector-button {
+            background: #444;
+            color: white;
+            border: none;
+            padding: 6px 12px;
+            border-radius: 4px;
+            cursor: pointer;
+            margin-right: 10px;
+        }
+        button {
+            background: #0078D7;
+            color: white;
+            border: none;
+            padding: 12px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: bold;
+            font-size: 16px;
+            transition: background 0.2s;
+            margin-top: 10px;
+        }
+        button:hover {
+            background: #005a9e;
+        }
+        button:disabled {
+            background: #555;
+            cursor: not-allowed;
+        }
+        #record-btn {
+            background: #d83b01;
+            margin-top: 0;
+        }
+        #record-btn:hover {
+            background: #b63201;
+        }
+    </style>
+    <!-- 使用 Import Map 引入 Three.js -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="ui-layer">
+        <div class="panel">
+            <h2>全景图环境构建器</h2>
+            <button id="record-btn">录制模式 (全屏)</button>
+            <div class="form-group">
+                <label>映射 (Mapping): Latitude Longitude Layout</label>
+                <input type="file" id="file-input" accept="image/*">
+            </div>
+            <div class="form-group">
+                <label>开场动画时长 (秒):</label>
+                <input type="number" id="duration-input" value="4" min="1" max="15" step="0.5">
+            </div>
+            <div class="form-group">
+                <label>鼠标控制灵敏度:</label>
+                <input type="number" id="sensitivity-input" value="1.0" min="0.1" max="5.0" step="0.1">
+            </div>
+            <div class="form-group">
+                <label>视角平滑度 (越小越平滑):</label>
+                <input type="number" id="smoothness-input" value="0.1" min="0.01" max="1.0" step="0.01">
+            </div>
+            <button id="start-btn">生成全景环境</button>
+        </div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+
+        let scene, camera, renderer;
+        let material, mesh;
+        const radius = 100;
+        
+        let animationData = {
+            animating: false,
+            controlsEnabled: false,
+            startTime: 0,
+            duration: 4000,
+            sensitivity: 1.0,
+            smoothness: 0.1
+        };
+
+        // 经纬度视角控制变量
+        let isDragging = false;
+        let previousMousePosition = { x: 0, y: 0 };
+        let lon = 0; // 当前经度
+        let lat = 0; // 当前纬度
+        let targetLon = 0; // 目标经度
+        let targetLat = 0; // 目标纬度
+
+        // 自定义着色器：平面投影变换为球面全景图
+        const vertexShader = `
+            varying vec2 vUv;
+            uniform float uProgress;
+            uniform float uRadius;
+            uniform float uPlaneW;
+            uniform float uPlaneH;
+
+            void main() {
+                vUv = uv;
+
+                // 1. 平面状态下的坐标 (正好覆盖摄像机视角的 2D 贴图)
+                vec3 posPlane;
+                posPlane.x = (uv.x - 0.5) * uPlaneW;
+                posPlane.y = (uv.y - 0.5) * uPlaneH;
+                posPlane.z = -uRadius;
+
+                // 2. 球面状态下的坐标 (等距柱状投影)
+                float theta = (uv.x - 0.5) * 2.0 * 3.14159265359; 
+                float phi = (0.5 - uv.y) * 3.14159265359;         
+                
+                vec3 posSphere;
+                posSphere.x = uRadius * cos(phi) * sin(theta);
+                posSphere.y = -uRadius * sin(phi);
+                posSphere.z = -uRadius * cos(phi) * cos(theta); 
+
+                // 3. 动态插值：在平面和球面之间平滑过渡
+                vec3 pos = mix(posPlane, posSphere, uProgress);
+                
+                // 确保在过渡过程中顶点不会穿透摄像机中心
+                float currentLen = length(pos);
+                float targetLen = mix(length(posPlane), uRadius, uProgress);
+                if (currentLen > 0.0001) {
+                    pos = (pos / currentLen) * targetLen;
+                }
+
+                gl_Position = projectionMatrix * modelViewMatrix * vec4(pos, 1.0);
+            }
+        `;
+
+        const fragmentShader = `
+            varying vec2 vUv;
+            uniform sampler2D uTexture;
+
+            void main() {
+                gl_FragColor = texture2D(uTexture, vUv);
+                
+                // 颜色空间校正
+                #include <tonemapping_fragment>
+                #include <colorspace_fragment>
+            }
+        `;
+
+        function init() {
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.set(0, 0, 0); 
+            // 初始化面向投影平面正中心
+            camera.lookAt(0, 0, -1);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.outputColorSpace = THREE.SRGBColorSpace;
+            document.body.appendChild(renderer.domElement);
+
+            // 屏蔽右键菜单，允许右键拖拽
+            document.addEventListener('contextmenu', event => event.preventDefault());
+
+            // 鼠标拖拽事件绑定
+            window.addEventListener('mousedown', (e) => {
+                if (!animationData.controlsEnabled) return;
+                isDragging = true;
+                previousMousePosition = { x: e.clientX, y: e.clientY };
+            });
+
+            window.addEventListener('mousemove', (e) => {
+                if (!animationData.controlsEnabled || !isDragging) return;
+                
+                const deltaMove = {
+                    x: e.clientX - previousMousePosition.x,
+                    y: e.clientY - previousMousePosition.y
+                };
+                
+                // 更新目标偏航角和俯仰角
+                targetLon -= deltaMove.x * 0.15 * animationData.sensitivity;
+                targetLat += deltaMove.y * 0.15 * animationData.sensitivity;
+                
+                // 限制俯仰角，防止画面翻转
+                targetLat = Math.max(-85, Math.min(85, targetLat));
+                
+                previousMousePosition = { x: e.clientX, y: e.clientY };
+            });
+
+            window.addEventListener('mouseup', () => { isDragging = false; });
+            window.addEventListener('mouseleave', () => { isDragging = false; });
+
+            // 滚轮缩放逻辑以调节远近 (FOV 缩放)
+            window.addEventListener('wheel', (e) => {
+                if (!animationData.controlsEnabled) return;
+                const zoomSpeed = 0.05;
+                camera.fov += e.deltaY * zoomSpeed;
+                camera.fov = THREE.MathUtils.clamp(camera.fov, 15, 120);
+                camera.updateProjectionMatrix();
+                recalcPlaneSize(); 
+            });
+
+            window.addEventListener('resize', onWindowResize);
+            
+            animate();
+        }
+
+        function calculatePlaneSize() {
+            const vFov = camera.fov * Math.PI / 180;
+            const hFov = 2 * Math.atan(Math.tan(vFov / 2) * camera.aspect);
+            const maxH = 2 * radius * Math.tan(vFov / 2) * 0.96; 
+            const maxW = 2 * radius * Math.tan(hFov / 2) * 0.96;
+            
+            let w = maxW;
+            let h = w / 2;
+            if (h > maxH) {
+                h = maxH;
+                w = h * 2;
+            }
+            return { w, h };
+        }
+
+        function recalcPlaneSize() {
+            if (material) {
+                const size = calculatePlaneSize();
+                material.uniforms.uPlaneW.value = size.w;
+                material.uniforms.uPlaneH.value = size.h;
+            }
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            recalcPlaneSize();
+        }
+
+        function buildEnvironment(texture) {
+            if (mesh) {
+                scene.remove(mesh);
+                mesh.geometry.dispose();
+                mesh.material.dispose();
+            }
+
+            const size = calculatePlaneSize();
+            const geometry = new THREE.PlaneGeometry(1, 1, 384, 192);
+            
+            material = new THREE.ShaderMaterial({
+                vertexShader: vertexShader,
+                fragmentShader: fragmentShader,
+                uniforms: {
+                    uTexture: { value: texture },
+                    uProgress: { value: 0.0 },
+                    uRadius: { value: radius },
+                    uPlaneW: { value: size.w },
+                    uPlaneH: { value: size.h }
+                },
+                side: THREE.DoubleSide,
+                transparent: true
+            });
+
+            mesh = new THREE.Mesh(geometry, material);
+            scene.add(mesh);
+        }
+
+        function easeInOutCubic(x) {
+            return x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2;
+        }
+
+        function animate(time) {
+            requestAnimationFrame(animate);
+
+            if (animationData.animating) {
+                let elapsed = time - animationData.startTime;
+                let progress = elapsed / animationData.duration;
+                
+                if (progress >= 1.0) {
+                    progress = 1.0;
+                    animationData.animating = false;
+                    animationData.controlsEnabled = true; // 动画结束启用交互
+                }
+                
+                if (material) {
+                    material.uniforms.uProgress.value = easeInOutCubic(progress);
+                }
+            }
+
+            // 更新相机视角位置 (平滑插值过渡)
+            if (animationData.controlsEnabled) {
+                lon += (targetLon - lon) * animationData.smoothness;
+                lat += (targetLat - lat) * animationData.smoothness;
+                
+                const phi = THREE.MathUtils.degToRad(90 - lat);
+                // -90度偏移对齐原本的初始化朝向坐标
+                const theta = THREE.MathUtils.degToRad(lon - 90);
+                
+                const target = new THREE.Vector3();
+                target.x = Math.sin(phi) * Math.cos(theta);
+                target.y = Math.cos(phi);
+                target.z = Math.sin(phi) * Math.sin(theta);
+                
+                camera.lookAt(target);
+            }
+
+            renderer.render(scene, camera);
+        }
+
+        // 录制模式全屏功能
+        document.getElementById('record-btn').addEventListener('click', () => {
+            const docElm = document.documentElement;
+            if (docElm.requestFullscreen) {
+                docElm.requestFullscreen();
+            } else if (docElm.webkitRequestFullscreen) { 
+                docElm.webkitRequestFullscreen();
+            } else if (docElm.msRequestFullscreen) {
+                docElm.msRequestFullscreen();
+            }
+            document.getElementById('record-btn').innerText = '已进入全屏';
+        });
+
+        // UI 事件绑定
+        document.getElementById('start-btn').addEventListener('click', () => {
+            const fileInput = document.getElementById('file-input');
+            const timeInput = document.getElementById('duration-input');
+            const sensInput = document.getElementById('sensitivity-input');
+            const smoothInput = document.getElementById('smoothness-input');
+            const btn = document.getElementById('start-btn');
+
+            if (!fileInput.files || fileInput.files.length === 0) {
+                alert('请先选择一张全景图文件！');
+                return;
+            }
+
+            const file = fileInput.files[0];
+            const duration = parseFloat(timeInput.value) || 3;
+            animationData.duration = duration * 1000;
+            animationData.sensitivity = parseFloat(sensInput.value) || 1.0;
+            animationData.smoothness = parseFloat(smoothInput.value) || 0.1;
+
+            btn.disabled = true;
+            btn.innerText = '加载中...';
+
+            const url = URL.createObjectURL(file);
+            const textureLoader = new THREE.TextureLoader();
+            textureLoader.load(url, (texture) => {
+                texture.colorSpace = THREE.SRGBColorSpace;
+                texture.wrapS = THREE.ClampToEdgeWrapping;
+                texture.wrapT = THREE.ClampToEdgeWrapping;
+                texture.minFilter = THREE.LinearFilter;
+
+                buildEnvironment(texture);
+                
+                document.getElementById('ui-layer').style.opacity = '0';
+                
+                setTimeout(() => {
+                    document.getElementById('ui-layer').style.display = 'none';
+                    // 隐藏鼠标指针
+                    document.body.classList.add('hide-cursor');
+                    // 启动动画
+                    animationData.animating = true;
+                    animationData.startTime = performance.now();
+                }, 500);
+                
+                URL.revokeObjectURL(url);
+            }, undefined, (err) => {
+                console.error(err);
+                alert('图片加载失败，请重试');
+                btn.disabled = false;
+                btn.innerText = '生成全景环境';
+            });
+        });
+
+        init();
+    </script>
+</body>
+</html>
